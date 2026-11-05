@@ -49,6 +49,14 @@
 		.group_size = ARRAY_SIZE(table##_func_group),		\
 	}
 
+#define PINCTRL_GPIO_FUNC_DESC(id, table)					\
+	{								\
+		.desc = PINCTRL_GPIO_PINFUNCTION(id, table##_groups,	\
+					 ARRAY_SIZE(table##_groups)),	\
+		.groups = table##_func_group,				\
+		.group_size = ARRAY_SIZE(table##_func_group),		\
+	}
+
 #define PINCTRL_CONF_DESC(p, offset, mask)				\
 	{								\
 		.pin = p,						\
@@ -73,7 +81,7 @@ struct airoha_pinctrl_func_group {
 		u32 offset;
 		u32 mask;
 		u32 val;
-	} regmap[2];
+	} regmap[3];
 	int regmap_size;
 };
 
@@ -115,6 +123,10 @@ enum airoha_pinctrl_confs_type {
 };
 
 struct airoha_pinctrl {
+	/* Serialize shared mux validation and register updates. */
+	struct mutex mux_lock;
+	bool check_mux_conflicts;
+
 	struct pinctrl_dev *ctrl;
 
 	struct pinctrl_desc desc;
@@ -131,6 +143,7 @@ struct airoha_pinctrl {
 };
 
 struct airoha_pinctrl_match_data {
+	bool check_mux_conflicts;
 	const char *chip_scu_compatible;
 	const char *pinctrl_name;
 	struct module *pinctrl_owner;

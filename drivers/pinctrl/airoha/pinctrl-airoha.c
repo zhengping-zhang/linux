@@ -400,57 +400,236 @@ static int airoha_pinctrl_add_gpiochip(struct airoha_pinctrl *pinctrl,
 }
 
 /* pinmux callbacks */
-static int airoha_pinmux_set_mux(struct pinctrl_dev *pctrl_dev,
-				 unsigned int selector,
-				 unsigned int group)
+static const struct airoha_pinctrl_func_group *
+airoha_pinmux_get_func_group(struct pinctrl_dev *pctldev,
+			     unsigned int selector, unsigned int group)
 {
-	struct airoha_pinctrl *pinctrl = pinctrl_dev_get_drvdata(pctrl_dev);
-	const struct airoha_pinctrl_func *func;
 	const struct function_desc *desc;
+	const struct airoha_pinctrl_func *func;
 	struct group_desc *grp;
 	int i;
 
-	desc = pinmux_generic_get_function(pctrl_dev, selector);
-	if (!desc)
-		return -EINVAL;
-
-	grp = pinctrl_generic_get_group(pctrl_dev, group);
-	if (!grp)
-		return -EINVAL;
-
-	dev_dbg(pctrl_dev->dev, "enable function %s group %s\n",
-		desc->func->name, grp->grp.name);
+	desc = pinmux_generic_get_function(pctldev, selector);
+	grp = pinctrl_generic_get_group(pctldev, group);
+	if (!desc || !grp)
+		return NULL;
 
 	func = desc->data;
-	for (i = 0; i < func->group_size; i++) {
-		const struct airoha_pinctrl_func_group *group;
-		int j;
+	for (i = 0; i < func->group_size; i++)
+		if (!strcmp(func->groups[i].name, grp->grp.name))
+			return &func->groups[i];
 
-		group = &func->groups[i];
-		if (strcmp(group->name, grp->grp.name))
-			continue;
+	return NULL;
+}
 
-		for (j = 0; j < group->regmap_size; j++) {
-			switch (group->regmap[j].mux) {
-			case AIROHA_FUNC_PWM_EXT_MUX:
-			case AIROHA_FUNC_PWM_MUX:
-				regmap_update_bits(pinctrl->regmap,
-						   group->regmap[j].offset,
-						   group->regmap[j].mask,
-						   group->regmap[j].val);
-				break;
-			default:
-				regmap_update_bits(pinctrl->chip_scu,
-						   group->regmap[j].offset,
-						   group->regmap[j].mask,
-						   group->regmap[j].val);
-				break;
-			}
+/* Shared mux bits can affect pads outside the requested pin group. */
+static bool
+airoha_pinmux_groups_conflict(const struct airoha_pinctrl_func_group *a,
+			      const struct airoha_pinctrl_func_group *b)
+{
+	int i, j;
+
+	for (i = 0; i < a->regmap_size; i++) {
+		for (j = 0; j < b->regmap_size; j++) {
+			u32 mask;
+
+			if ((a->regmap[i].mux == AIROHA_FUNC_MUX) !=
+			    (b->regmap[j].mux == AIROHA_FUNC_MUX) ||
+			    a->regmap[i].offset != b->regmap[j].offset)
+				continue;
+
+			mask = a->regmap[i].mask & b->regmap[j].mask;
+			if (mask & (a->regmap[i].val ^ b->regmap[j].val))
+				return true;
 		}
-		return 0;
 	}
 
-	return -EINVAL;
+	return false;
+}
+
+/* Use pinctrl pin numbers, including GPIO ranges with nonzero pin_base. */
+static const struct airoha_pinctrl_func_group *
+airoha_pinmux_get_gpio_group(struct pinctrl_dev *pctldev, unsigned int pin)
+{
+	unsigned int selector, count;
+
+	count = pinmux_generic_get_function_count(pctldev);
+	for (selector = 0; selector < count; selector++) {
+		const struct airoha_pinctrl_func *func;
+		const struct function_desc *desc;
+		int i;
+
+		if (!pinmux_generic_function_is_gpio(pctldev, selector))
+			continue;
+		desc = pinmux_generic_get_function(pctldev, selector);
+		if (!desc)
+			continue;
+
+		func = desc->data;
+		for (i = 0; i < func->group_size; i++) {
+			struct group_desc *grp;
+			int group;
+
+			group = pinctrl_get_group_selector(pctldev,
+							   func->groups[i].name);
+			if (group < 0)
+				continue;
+			grp = pinctrl_generic_get_group(pctldev, group);
+			if (grp && grp->grp.npins == 1 &&
+			    grp->grp.pins[0] == pin)
+				return &func->groups[i];
+		}
+	}
+
+	return NULL;
+}
+
+static int
+airoha_pinmux_check_conflicts(struct pinctrl_dev *pctldev,
+			      const struct airoha_pinctrl_func_group *group)
+{
+	unsigned int i;
+
+	for (i = 0; i < pctldev->desc->npins; i++) {
+		const struct airoha_pinctrl_func_group *active;
+		struct pinctrl_setting_mux setting;
+		unsigned int number = pctldev->desc->pins[i].number;
+		struct pin_desc *pin;
+		bool claimed, gpio_owned;
+
+		pin = pin_desc_get(pctldev, number);
+		if (!pin)
+			continue;
+
+		scoped_guard(mutex, &pin->mux_lock) {
+			claimed = pin->mux_usecount && pin->mux_setting;
+			gpio_owned = !!pin->gpio_owner;
+			if (claimed)
+				setting = *pin->mux_setting;
+		}
+
+		/* GPIO requests need no explicit DTS pinctrl state. */
+		if (gpio_owned) {
+			active = airoha_pinmux_get_gpio_group(pctldev, number);
+			if (!active)
+				return -EOPNOTSUPP;
+			if (airoha_pinmux_groups_conflict(group, active))
+				goto conflict;
+		}
+
+		if (!claimed)
+			continue;
+		active = airoha_pinmux_get_func_group(pctldev, setting.func,
+						      setting.group);
+		if (!active)
+			return -EINVAL;
+		if (!airoha_pinmux_groups_conflict(group, active))
+			continue;
+
+conflict:
+		dev_err(pctldev->dev,
+			"group %s conflicts with shared mux bits of group %s\n",
+			group->name, active->name);
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
+/* Caller holds mux_lock across validation and the register updates. */
+static int
+airoha_pinmux_apply_group(struct airoha_pinctrl *pinctrl,
+			  const struct airoha_pinctrl_func_group *config)
+{
+	int i, err;
+
+	for (i = 0; i < config->regmap_size; i++) {
+		struct regmap *map;
+
+		if (!config->regmap[i].mask)
+			continue;
+		map = config->regmap[i].mux == AIROHA_FUNC_MUX ?
+		      pinctrl->chip_scu : pinctrl->regmap;
+		err = regmap_update_bits(map, config->regmap[i].offset,
+					 config->regmap[i].mask,
+					 config->regmap[i].val);
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+static int
+airoha_gpio_request_enable(struct pinctrl_dev *pctldev,
+			   struct pinctrl_gpio_range *range, unsigned int pin)
+{
+	struct airoha_pinctrl *pinctrl = pinctrl_dev_get_drvdata(pctldev);
+	const struct airoha_pinctrl_func_group *config;
+	int err;
+
+	/* Other SoCs retain their existing request behavior. */
+	if (!pinctrl->check_mux_conflicts)
+		return 0;
+	if (!range)
+		return -EINVAL;
+
+	config = airoha_pinmux_get_gpio_group(pctldev, pin);
+	if (!config)
+		return dev_err_probe(pctldev->dev, -EOPNOTSUPP,
+				     "no verified GPIO mux for pin %u\n", pin);
+
+	guard(mutex)(&pinctrl->mux_lock);
+	err = airoha_pinmux_check_conflicts(pctldev, config);
+	if (err)
+		return err;
+
+	dev_dbg(pctldev->dev, "request GPIO mux group %s pin %u\n",
+		config->name, pin);
+	return airoha_pinmux_apply_group(pinctrl, config);
+}
+
+static int airoha_pinmux_set_mux(struct pinctrl_dev *pctldev,
+				 unsigned int selector, unsigned int group)
+{
+	struct airoha_pinctrl *pinctrl = pinctrl_dev_get_drvdata(pctldev);
+	const struct airoha_pinctrl_func_group *config;
+	int i, err;
+
+	config = airoha_pinmux_get_func_group(pctldev, selector, group);
+	if (!config)
+		return -EINVAL;
+
+	guard(mutex)(&pinctrl->mux_lock);
+	if (pinctrl->check_mux_conflicts) {
+		struct group_desc *grp;
+
+		/* The core permits GPIO-category muxes alongside GPIO owners. */
+		grp = pinctrl_generic_get_group(pctldev, group);
+		if (!pinmux_generic_function_is_gpio(pctldev, selector)) {
+			for (i = 0; i < grp->grp.npins; i++) {
+				struct pin_desc *pin;
+
+				pin = pin_desc_get(pctldev, grp->grp.pins[i]);
+				if (!pin)
+					return -EINVAL;
+				scoped_guard(mutex, &pin->mux_lock) {
+					if (pin->gpio_owner)
+						return -EBUSY;
+				}
+			}
+		}
+
+		err = airoha_pinmux_check_conflicts(pctldev, config);
+		if (err)
+			return err;
+	}
+
+	dev_dbg(pctldev->dev, "enable function %s group %s\n",
+		pinmux_generic_get_function_name(pctldev, selector),
+		config->name);
+
+	return airoha_pinmux_apply_group(pinctrl, config);
 }
 
 static int airoha_pinmux_set_direction(struct pinctrl_dev *pctrl_dev,
@@ -468,6 +647,8 @@ static int airoha_pinmux_set_direction(struct pinctrl_dev *pctrl_dev,
 }
 
 static const struct pinmux_ops airoha_pmxops = {
+	.gpio_request_enable = airoha_gpio_request_enable,
+	.function_is_gpio = pinmux_generic_function_is_gpio,
 	.get_functions_count = pinmux_generic_get_function_count,
 	.get_function_name = pinmux_generic_get_function_name,
 	.get_function_groups = pinmux_generic_get_function_groups,
@@ -822,6 +1003,9 @@ int airoha_pinctrl_probe(struct platform_device *pdev)
 	}
 
 	pinctrl->chip_scu = map;
+
+	mutex_init(&pinctrl->mux_lock);
+	pinctrl->check_mux_conflicts = data->check_mux_conflicts;
 
 	/* Init pinctrl desc struct */
 	pinctrl->desc.name = data->pinctrl_name;
